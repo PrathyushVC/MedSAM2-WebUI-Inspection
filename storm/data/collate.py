@@ -1,37 +1,32 @@
-"""
-Custom collate function for spatial spot batches.
-
-Handles optional fields (coords, label) gracefully and stacks everything
-into tensors ready for the model forward pass.
-"""
-
 from __future__ import annotations
 
 from typing import Dict, List
 
 import torch
-from torch.utils.data.dataloader import default_collate
 
 
 def spatial_collate_fn(batch: List[dict]) -> Dict[str, torch.Tensor]:
-    """
-    Collate a list of spot dicts into a batch dict.
+    """Collate a list of spot sample dicts into a batched dict.
 
-    Required keys in each sample: "image", "omics", "spot_idx".
-    Optional keys forwarded if present: "coords", "label".
+    Handles optional fields (``coords``, ``label``) gracefully; they are
+    included in the output only if present in every sample.
+
+    Args:
+        batch: List of dicts, each containing at minimum ``"image"`` (float
+            tensor, ``C×H×W``), ``"omics"`` (float tensor, ``G``), and
+            ``"spot_idx"`` (int).
+
+    Returns:
+        Dict with stacked tensors keyed by field name.
     """
     keys = batch[0].keys()
-    out: dict = {}
-
-    # Always-present tensors
-    out["image"] = torch.stack([s["image"] for s in batch])      # (B, 3, H, W)
-    out["omics"] = torch.stack([s["omics"] for s in batch])      # (B, G)
-    out["spot_idx"] = torch.tensor([s["spot_idx"] for s in batch])
-
-    # Optional tensors
+    out: dict = {
+        "image": torch.stack([s["image"] for s in batch]),
+        "omics": torch.stack([s["omics"] for s in batch]),
+        "spot_idx": torch.tensor([s["spot_idx"] for s in batch]),
+    }
     if "coords" in keys:
-        out["coords"] = torch.stack([s["coords"] for s in batch])  # (B, 2)
+        out["coords"] = torch.stack([s["coords"] for s in batch])
     if "label" in keys:
         out["label"] = torch.tensor([s["label"] for s in batch], dtype=torch.long)
-
     return out

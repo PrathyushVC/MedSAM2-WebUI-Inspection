@@ -1,40 +1,79 @@
-"""
-SpatialSpotDataset — loads histology image patches and gene expression vectors
-for spatial transcriptomics experiments.
-
-Supported file formats
-----------------------
-HDF5  (.h5):   datasets "expr" (N×G), "patches" (N×H×W×3), optionally
-               "coords" (N×2) and "labels" (N,).
-NPZ   (.npz):  arrays with the same keys.
-Directory:     expr.npy, patches.npy, optionally coords.npy / labels.npy.
-
-All splits (train / val / test) are carved out of the same file via a
-deterministic random permutation seeded by `seed`.
-"""
-
 from __future__ import annotations
 
 import os
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional
 
 import numpy as np
 import torch
+from monai.transforms import Compose, NormalizeIntensity, RandFlip, RandRotate90, Resize
 from torch.utils.data import DataLoader, Dataset
 
 
-class SpatialSpotDataset(Dataset):
-    """
+def default_train_transform(img_size: int) -> Compose:
+    """Build a standard training augmentation pipeline using MONAI transforms.
+
+    Applies spatial flips, 90-degree rotations, and per-channel intensity
+    normalisation. All transforms operate on channel-first float tensors.
+
     Args:
-        data_path:    Path to .h5, .npz, or directory.
-        img_size:     Side length (pixels) to resize patches to; 0 = no resize.
-        transform:    torchvision-compatible callable applied to the CHW float
-                      tensor AFTER converting from uint8.
-        split:        "train", "val", or "test".
-        split_ratio:  Fraction of spots used for training (rest split 50/50
-                      between val and test).
-        seed:         Random seed for the train/val/test split.
-        gene_filter:  Optional array of gene indices to retain (sub-panel).
+        img_size: Target square spatial resolution in pixels.
+
+    Returns:
+        A ``monai.transforms.Compose`` object ready to be called on a
+        ``(C, H, W)`` float tensor.
+    """
+    return Compose([
+        Resize(spatial_size=(img_size, img_size)),
+        RandFlip(spatial_axis=0, prob=0.5),
+        RandFlip(spatial_axis=1, prob=0.5),
+        RandRotate90(prob=0.5, max_k=3, spatial_axes=(0, 1)),
+        NormalizeIntensity(channel_wise=True),
+    ])
+
+
+def default_val_transform(img_size: int) -> Compose:
+    """Build a deterministic validation preprocessing pipeline using MONAI transforms.
+
+    Args:
+        img_size: Target square spatial resolution in pixels.
+
+    Returns:
+        A ``monai.transforms.Compose`` object.
+    """
+    return Compose([
+        Resize(spatial_size=(img_size, img_size)),
+        NormalizeIntensity(channel_wise=True),
+    ])
+
+
+class SpatialSpotDataset(Dataset):
+    """Dataset of histology image patches and gene expression profiles for spatial
+    transcriptomics spots.
+
+    Supported data formats:
+
+    - **HDF5** (``.h5``): datasets ``expr`` (N×G), ``patches`` (N×H×W×3),
+      optionally ``coords`` (N×2) and ``labels`` (N,).
+    - **NPZ** (``.npz``): same array keys.
+    - **Directory**: ``expr.npy``, ``patches.npy``, optionally ``coords.npy``
+      and ``labels.npy``.
+
+    The train / val / test split is derived via a seeded random permutation, so
+    all three splits are carved from the same file without needing separate files.
+
+    Args:
+        data_path: Path to a ``.h5`` file, a ``.npz`` file, or a directory.
+        img_size: Target square spatial resolution; patches are resized if
+            their stored size differs.  Pass ``0`` to skip resizing.
+        transform: Callable applied to the ``(C, H, W)`` float patch tensor.
+            Defaults to ``default_train_transform`` or ``default_val_transform``
+            depending on ``split``, unless explicitly overridden.
+        split: One of ``"train"``, ``"val"``, ``"test"``, or ``"all"``.
+        split_ratio: Fraction of spots used for training; the remainder is split
+            evenly between val and test.
+        seed: RNG seed for the split permutation.
+        gene_filter: Optional integer array of gene indices to retain, allowing
+            a subset of the stored panel to be used.
     """
 
     def __init__(
@@ -48,8 +87,6 @@ class SpatialSpotDataset(Dataset):
         gene_filter: Optional[np.ndarray] = None,
     ):
         self.img_size = img_size
-        self.transform = transform
-
         self._load(data_path)
 
         if gene_filter is not None:
@@ -57,9 +94,12 @@ class SpatialSpotDataset(Dataset):
 
         self.indices = self._split_indices(split, split_ratio, seed)
 
-    # ------------------------------------------------------------------
-    # Loading helpers
-    # ------------------------------------------------------------------
+        if transform is not None:
+            self.transform = transform
+        elif split == "train":
+            self.transform = default_train_transform(img_size) if img_size > 0 else None
+        else:
+            self.transform = default_val_transform(img_size) if img_size > 0 else None
 
     def _load(self, path: str):
         if os.path.isfile(path) and path.endswith(".h5"):
@@ -69,10 +109,7 @@ class SpatialSpotDataset(Dataset):
         elif os.path.isdir(path):
             self._load_dir(path)
         else:
-            raise ValueError(
-                f"Unsupported data path: {path!r}. "
-                "Expected .h5, .npz, or a directory."
-            )
+            raise ValueError(f"Unsupported data source: {path!r}. Expected .h5, .npz, or directory.")
 
     def _load_h5(self, path: str):
         import h5py
@@ -92,8 +129,7 @@ class SpatialSpotDataset(Dataset):
     def _load_dir(self, path: str):
         self.expr = np.load(os.path.join(path, "expr.npy"))
         self.patches = np.load(os.path.join(path, "patches.npy"))
-        coords_p = os.path.join(path, "coords.npy")
-        labels_p = os.path.join(path, "labels.npy")
+        coords_p, labels_p = os.path.join(path, "coords.npy"), os.path.join(path, "labels.npy")
         self.coords = np.load(coords_p) if os.path.exists(coords_p) else None
         self.labels = np.load(labels_p) if os.path.exists(labels_p) else None
 
@@ -103,72 +139,47 @@ class SpatialSpotDataset(Dataset):
         idx = rng.permutation(N)
         n_train = int(N * ratio)
         n_val = (N - n_train) // 2
-        if split == "train":
-            return idx[:n_train]
-        elif split == "val":
-            return idx[n_train : n_train + n_val]
-        elif split == "test":
-            return idx[n_train + n_val :]
-        else:  # "all"
-            return idx
-
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
+        mapping = {
+            "train": idx[:n_train],
+            "val": idx[n_train: n_train + n_val],
+            "test": idx[n_train + n_val:],
+            "all": idx,
+        }
+        if split not in mapping:
+            raise ValueError(f"split must be one of {list(mapping)}, got {split!r}")
+        return mapping[split]
 
     @property
     def num_genes(self) -> int:
+        """Number of genes in the (possibly filtered) expression panel."""
         return self.expr.shape[1]
 
     @property
     def num_spots(self) -> int:
+        """Number of spots in the active split."""
         return len(self.indices)
-
-    # ------------------------------------------------------------------
-    # Dataset interface
-    # ------------------------------------------------------------------
 
     def __len__(self) -> int:
         return len(self.indices)
 
     def __getitem__(self, idx: int) -> dict:
         real_idx = int(self.indices[idx])
-
-        # Gene expression: (G,) float32
         expr = torch.from_numpy(self.expr[real_idx].astype(np.float32))
 
-        # Image patch: uint8 HWC or CHW → float32 CHW in [0, 1]
         patch = self.patches[real_idx]
         if patch.ndim == 3 and patch.shape[2] == 3:
-            patch = patch.transpose(2, 0, 1)               # HWC → CHW
+            patch = patch.transpose(2, 0, 1)
         patch = torch.from_numpy(patch.astype(np.float32)) / 255.0
-
-        if self.img_size > 0 and patch.shape[-1] != self.img_size:
-            import torch.nn.functional as F
-            patch = F.interpolate(
-                patch.unsqueeze(0),
-                size=(self.img_size, self.img_size),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(0)
 
         if self.transform is not None:
             patch = self.transform(patch)
 
-        item: dict = {"image": patch, "omics": expr, "spot_idx": real_idx}
-
+        item = {"image": patch, "omics": expr, "spot_idx": real_idx}
         if self.coords is not None:
-            item["coords"] = torch.from_numpy(
-                self.coords[real_idx].astype(np.float32)
-            )
+            item["coords"] = torch.from_numpy(self.coords[real_idx].astype(np.float32))
         if self.labels is not None:
             item["label"] = int(self.labels[real_idx])
-
         return item
-
-    # ------------------------------------------------------------------
-    # DataLoader factory
-    # ------------------------------------------------------------------
 
     def get_loader(
         self,
@@ -178,6 +189,18 @@ class SpatialSpotDataset(Dataset):
         pin_memory: bool = True,
         drop_last: bool = True,
     ) -> DataLoader:
+        """Construct a DataLoader for this dataset split.
+
+        Args:
+            batch_size: Number of spots per batch.
+            num_workers: Parallel data-loading workers.
+            shuffle: Whether to shuffle between epochs.
+            pin_memory: Pin tensors to CUDA pinned memory for faster transfer.
+            drop_last: Drop the final incomplete batch.
+
+        Returns:
+            A configured ``torch.utils.data.DataLoader``.
+        """
         return DataLoader(
             self,
             batch_size=batch_size,
@@ -188,14 +211,17 @@ class SpatialSpotDataset(Dataset):
         )
 
 
-# ---------------------------------------------------------------------------
-# Synthetic dataset for unit tests / smoke tests (no real data needed)
-# ---------------------------------------------------------------------------
-
 class SyntheticSpatialDataset(Dataset):
-    """
-    Generates random (image, omics) pairs in-memory.
-    Useful for debugging and CI smoke tests without real data.
+    """In-memory random dataset for smoke tests and unit tests.
+
+    Generates Gaussian random image patches and expression profiles so that
+    the full training pipeline can be validated without any real data files.
+
+    Args:
+        num_spots: Number of synthetic spots.
+        num_genes: Gene panel width.
+        img_size: Square spatial resolution of generated patches.
+        seed: NumPy RNG seed.
     """
 
     def __init__(
@@ -222,5 +248,14 @@ class SyntheticSpatialDataset(Dataset):
             "spot_idx": idx,
         }
 
-    def get_loader(self, batch_size: int = 64, **kw) -> DataLoader:
-        return DataLoader(self, batch_size=batch_size, shuffle=kw.get("shuffle", True))
+    def get_loader(self, batch_size: int = 64, shuffle: bool = True) -> DataLoader:
+        """Construct a DataLoader for the synthetic dataset.
+
+        Args:
+            batch_size: Spots per batch.
+            shuffle: Whether to shuffle each epoch.
+
+        Returns:
+            A configured ``torch.utils.data.DataLoader``.
+        """
+        return DataLoader(self, batch_size=batch_size, shuffle=shuffle)

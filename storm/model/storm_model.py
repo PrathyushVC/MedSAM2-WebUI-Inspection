@@ -1,14 +1,3 @@
-"""
-Full STORM model: image encoder + omics encoder + cross-modal fusion.
-
-The forward pass always encodes both modalities from their real inputs so that:
-  - Clean embeddings are available for the contrastive loss.
-  - The fusion module receives proper ground-truth features to substitute with
-    mask tokens for the modality-dropout-aware fused representation.
-  - Cross-modal prediction heads (omics from image, image-feat from omics) are
-    trained from the fused representation.
-"""
-
 from __future__ import annotations
 
 from typing import Dict, Optional
@@ -16,30 +5,34 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
+from .fusion import CrossModalFusion
 from .image_encoder import ImageEncoder
 from .omics_encoder import OmicsEncoder
-from .fusion import CrossModalFusion
 
 
 class STORMModel(nn.Module):
-    """
-    Dual-encoder + cross-modal fusion model for spatial transcriptomics.
+    """Dual-encoder cross-modal fusion model for spatial transcriptomics.
+
+    Both modalities are always encoded from their real inputs on each forward
+    pass. The clean embeddings drive the contrastive projection heads; the
+    fusion module then receives mask-token substitutions for whichever
+    modality was designated as dropped, training robustness to missing data.
 
     Args:
-        num_genes:                Number of genes in the expression panel.
-        embed_dim:                Shared embedding dimension for all modules.
-        img_size:                 Input image patch size (pixels, square assumed).
-        patch_size:               ViT patch size (only used when no backbone).
-        img_encoder_depth:        ViT depth for image encoder.
-        img_encoder_heads:        ViT attention heads for image encoder.
-        omics_encoder_depth:      Transformer depth for omics encoder.
-        omics_encoder_heads:      Attention heads for omics encoder.
-        omics_hidden_dim:         MLP width inside omics encoder (bulk mode).
-        fusion_depth:             Cross-attention blocks in fusion module.
-        fusion_heads:             Attention heads in fusion module.
-        dropout:                  Shared dropout probability.
-        pretrained_image_backbone: timm model name for a pretrained image encoder.
-        use_gene_tokens:          If True, each gene is its own transformer token.
+        num_genes: Number of genes in the expression panel.
+        embed_dim: Shared embedding dimension across all sub-modules.
+        img_size: Square spatial resolution of input image patches in pixels.
+        patch_size: ViT patch size; must evenly divide ``img_size``.
+        img_encoder_depth: Number of transformer layers in the image encoder.
+        img_encoder_heads: Attention heads in the image encoder.
+        omics_encoder_depth: Number of transformer layers in the omics encoder.
+        omics_encoder_heads: Attention heads in the omics encoder.
+        omics_hidden_dim: MLP bottleneck width in the omics encoder (bulk mode).
+        fusion_depth: Number of cross-attention blocks in the fusion module.
+        fusion_heads: Attention heads in the fusion module.
+        dropout: Dropout probability shared across all sub-modules.
+        pretrained_image_backbone: Optional timm model name for the image encoder.
+        use_gene_tokens: When ``True``, each gene becomes its own omics token.
     """
 
     def __init__(
@@ -63,9 +56,6 @@ class STORMModel(nn.Module):
         self.num_genes = num_genes
         self.embed_dim = embed_dim
 
-        # ------------------------------------------------------------------
-        # Modality encoders
-        # ------------------------------------------------------------------
         self.image_encoder = ImageEncoder(
             img_size=img_size,
             patch_size=patch_size,
@@ -84,20 +74,12 @@ class STORMModel(nn.Module):
             dropout=dropout,
             use_gene_tokens=use_gene_tokens,
         )
-
-        # ------------------------------------------------------------------
-        # Fusion
-        # ------------------------------------------------------------------
         self.fusion = CrossModalFusion(
             embed_dim=embed_dim,
             num_heads=fusion_heads,
             depth=fusion_depth,
             dropout=dropout,
         )
-
-        # ------------------------------------------------------------------
-        # Projection heads for contrastive loss (separate from backbone)
-        # ------------------------------------------------------------------
         self.img_proj = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.GELU(),
@@ -108,11 +90,6 @@ class STORMModel(nn.Module):
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim),
         )
-
-        # ------------------------------------------------------------------
-        # Cross-modal prediction heads (trained via reconstruction losses)
-        # ------------------------------------------------------------------
-        # Predict gene expression from fused representation
         self.omics_predictor = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 2),
             nn.GELU(),
@@ -120,7 +97,6 @@ class STORMModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(embed_dim * 2, num_genes),
         )
-        # Predict image embedding from fused representation
         self.image_feat_predictor = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 2),
             nn.GELU(),
@@ -129,10 +105,6 @@ class STORMModel(nn.Module):
             nn.Linear(embed_dim * 2, embed_dim),
         )
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
-
     def forward(
         self,
         images: torch.Tensor,
@@ -140,64 +112,73 @@ class STORMModel(nn.Module):
         drop_image: torch.Tensor,
         drop_omics: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """
+        """Run a full forward pass with modality-dropout masking.
+
         Args:
-            images:     (B, 3, H, W) float32 image patches.
-            omics:      (B, G) float32 log-normalised gene expression.
-            drop_image: (B,) bool — image modality dropped (masked) for this spot.
-            drop_omics: (B,) bool — omics modality dropped (masked) for this spot.
+            images: Float32 image patches of shape ``(B, 3, H, W)``.
+            omics: Float32 log-normalised expression matrix of shape ``(B, G)``.
+            drop_image: Boolean mask of shape ``(B,)``; ``True`` means the image
+                modality is dropped (replaced by mask token in fusion) for
+                that spot.
+            drop_omics: Boolean mask of shape ``(B,)``; same semantics as
+                ``drop_image`` for the omics modality.
 
         Returns:
-            Dictionary containing:
-              img_embed:      (B, D) clean image embeddings (pre-masking).
-              omics_embed:    (B, D) clean omics embeddings (pre-masking).
-              img_proj:       (B, D) image projection for contrastive loss.
-              omics_proj:     (B, D) omics projection for contrastive loss.
-              fused:          (B, D) fused representation (mask-token aware).
-              pred_omics:     (B, G) gene expression predicted from fused.
-              pred_img_feat:  (B, D) image features predicted from fused.
+            Dictionary with keys:
+
+            - ``img_embed``: ``(B, D)`` clean image embeddings.
+            - ``omics_embed``: ``(B, D)`` clean omics embeddings.
+            - ``img_proj``: ``(B, D)`` image projections for contrastive loss.
+            - ``omics_proj``: ``(B, D)`` omics projections for contrastive loss.
+            - ``fused``: ``(B, D)`` mask-token-aware fused representation.
+            - ``pred_omics``: ``(B, G)`` gene expression predicted from fused.
+            - ``pred_img_feat``: ``(B, D)`` image features predicted from fused.
         """
-        # Always encode from real data — clean embeddings used for contrastive
-        img_embed = self.image_encoder(images)    # (B, D)
-        omics_embed = self.omics_encoder(omics)   # (B, D)
-
-        # Contrastive projection heads
-        img_proj = self.img_proj(img_embed)
-        omics_proj = self.omics_proj(omics_embed)
-
-        # Fuse with mask-token substitution for dropped modalities
+        img_embed = self.image_encoder(images)
+        omics_embed = self.omics_encoder(omics)
         fused = self.fusion(img_embed, omics_embed, drop_image, drop_omics)
-
-        # Cross-modal predictions from fused representation
-        pred_omics = self.omics_predictor(fused)         # (B, G)
-        pred_img_feat = self.image_feat_predictor(fused) # (B, D)
-
         return {
             "img_embed": img_embed,
             "omics_embed": omics_embed,
-            "img_proj": img_proj,
-            "omics_proj": omics_proj,
+            "img_proj": self.img_proj(img_embed),
+            "omics_proj": self.omics_proj(omics_embed),
             "fused": fused,
-            "pred_omics": pred_omics,
-            "pred_img_feat": pred_img_feat,
+            "pred_omics": self.omics_predictor(fused),
+            "pred_img_feat": self.image_feat_predictor(fused),
         }
 
     def encode_image_only(self, images: torch.Tensor) -> torch.Tensor:
-        """Inference helper: encode images with omics masked out entirely."""
-        B = images.shape[0]
-        device = images.device
+        """Return fused embeddings for a batch where omics is entirely absent.
+
+        Args:
+            images: Float32 image patches of shape ``(B, 3, H, W)``.
+
+        Returns:
+            Fused embeddings of shape ``(B, D)``.
+        """
+        B, device = images.shape[0], images.device
         dummy_omics = torch.zeros(B, self.num_genes, device=device)
-        drop_image = torch.zeros(B, dtype=torch.bool, device=device)
-        drop_omics = torch.ones(B, dtype=torch.bool, device=device)
-        out = self.forward(images, dummy_omics, drop_image, drop_omics)
+        out = self.forward(
+            images, dummy_omics,
+            drop_image=torch.zeros(B, dtype=torch.bool, device=device),
+            drop_omics=torch.ones(B, dtype=torch.bool, device=device),
+        )
         return out["fused"]
 
     def encode_omics_only(self, omics: torch.Tensor) -> torch.Tensor:
-        """Inference helper: encode omics with image masked out entirely."""
-        B = omics.shape[0]
-        device = omics.device
+        """Return fused embeddings for a batch where the image is entirely absent.
+
+        Args:
+            omics: Float32 expression matrix of shape ``(B, G)``.
+
+        Returns:
+            Fused embeddings of shape ``(B, D)``.
+        """
+        B, device = omics.shape[0], omics.device
         dummy_images = torch.zeros(B, 3, 224, 224, device=device)
-        drop_image = torch.ones(B, dtype=torch.bool, device=device)
-        drop_omics = torch.zeros(B, dtype=torch.bool, device=device)
-        out = self.forward(dummy_images, omics, drop_image, drop_omics)
+        out = self.forward(
+            dummy_images, omics,
+            drop_image=torch.ones(B, dtype=torch.bool, device=device),
+            drop_omics=torch.zeros(B, dtype=torch.bool, device=device),
+        )
         return out["fused"]

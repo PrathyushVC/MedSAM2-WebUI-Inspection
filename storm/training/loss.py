@@ -1,28 +1,3 @@
-"""
-STORM loss functions.
-
-Loss components and when they apply
--------------------------------------
-contrastive     : NT-Xent (CLIP-style) between image and omics projections.
-                  Applied only where BOTH modalities are present as inputs
-                  (has_both mask). Needs ≥ 2 such spots per batch.
-
-omics_recon     : MSE between pred_omics and ground-truth gene expression.
-                  Applied where ONLY image is present (image-only spots) so
-                  the model must hallucinate omics from image information alone.
-
-omics_recon_reg : Same prediction, but applied on both-present spots as a
-                  soft regulariser (weight typically << w_omics_recon).
-
-img_feat_recon  : Cosine similarity between pred_img_feat and the detached
-                  clean image embedding. Applied where ONLY omics is present.
-
-Total loss = w_contrastive * contrastive
-           + w_omics_recon * omics_recon
-           + w_omics_recon_reg * omics_recon_reg
-           + w_img_feat_recon * img_feat_recon
-"""
-
 from __future__ import annotations
 
 from typing import Dict, Tuple
@@ -32,16 +7,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ---------------------------------------------------------------------------
-# Individual loss modules
-# ---------------------------------------------------------------------------
-
 class NTXentLoss(nn.Module):
-    """
-    Symmetric NT-Xent (InfoNCE) contrastive loss between two sets of embeddings.
+    """Symmetric NT-Xent (InfoNCE) contrastive loss for matched embedding pairs.
 
-    The temperature is a learnable log-scalar clamped to [0.01, 100] to prevent
-    training instability.
+    The temperature is a learnable log-scalar, clamped to ``[0.01, 100]`` to
+    avoid numerical instability at the extremes.
+
+    Args:
+        temperature: Initial contrastive temperature value.
     """
 
     def __init__(self, temperature: float = 0.07):
@@ -50,36 +23,32 @@ class NTXentLoss(nn.Module):
 
     @property
     def temperature(self) -> torch.Tensor:
+        """Clamped temperature derived from the learnable log parameter."""
         return self.log_temp.exp().clamp(min=0.01, max=100.0)
 
-    def forward(
-        self,
-        img_proj: torch.Tensor,
-        omics_proj: torch.Tensor,
-    ) -> torch.Tensor:
-        """
+    def forward(self, img_proj: torch.Tensor, omics_proj: torch.Tensor) -> torch.Tensor:
+        """Compute the symmetric contrastive loss between two embedding sets.
+
         Args:
-            img_proj:   (N, D) image projections for N matched spots.
-            omics_proj: (N, D) omics projections for the same N spots.
+            img_proj: L2-normalised image projections of shape ``(N, D)``.
+            omics_proj: L2-normalised omics projections of shape ``(N, D)``,
+                matched one-to-one with ``img_proj``.
+
         Returns:
             Scalar contrastive loss.
         """
-        assert img_proj.shape == omics_proj.shape
         img_proj = F.normalize(img_proj, dim=-1)
         omics_proj = F.normalize(omics_proj, dim=-1)
-
-        logits = torch.matmul(img_proj, omics_proj.T) / self.temperature  # (N, N)
+        logits = torch.matmul(img_proj, omics_proj.T) / self.temperature
         labels = torch.arange(len(logits), device=logits.device)
-
-        loss_i2o = F.cross_entropy(logits, labels)
-        loss_o2i = F.cross_entropy(logits.T, labels)
-        return (loss_i2o + loss_o2i) / 2.0
+        return (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2.0
 
 
 class OmicsReconLoss(nn.Module):
-    """
-    MSE reconstruction loss for gene expression.
-    Only computes on spots indicated by the boolean mask.
+    """Masked MSE loss for reconstructing gene expression profiles.
+
+    Only spots selected by the boolean ``mask`` contribute to the loss,
+    enabling scenario-specific supervision (e.g. only image-only spots).
     """
 
     def forward(
@@ -88,13 +57,15 @@ class OmicsReconLoss(nn.Module):
         target: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
+        """Compute masked mean-squared error over expression profiles.
+
         Args:
-            pred:   (B, G) predicted expression values.
-            target: (B, G) ground-truth expression values.
-            mask:   (B,) bool — True ⟹ include this spot in the loss.
+            pred: Predicted expression values of shape ``(B, G)``.
+            target: Ground-truth expression values of shape ``(B, G)``.
+            mask: Boolean tensor of shape ``(B,)``; ``True`` = include this spot.
+
         Returns:
-            Scalar MSE loss (zero-gradient zero if no spots selected).
+            Scalar MSE loss; differentiably zero when no spots are selected.
         """
         if not mask.any():
             return pred.sum() * 0.0
@@ -102,9 +73,10 @@ class OmicsReconLoss(nn.Module):
 
 
 class ImageFeatReconLoss(nn.Module):
-    """
-    Cosine-distance loss for reconstructing image features from the other modality.
-    Target embeddings are detached so gradients only flow through the predictor.
+    """Masked cosine-distance loss for reconstructing image feature vectors.
+
+    The target embeddings are detached so gradients flow only through the
+    predictor, not back into the image encoder.
     """
 
     def forward(
@@ -113,36 +85,47 @@ class ImageFeatReconLoss(nn.Module):
         target: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
+        """Compute masked cosine-distance loss between predicted and target features.
+
         Args:
-            pred:   (B, D) predicted image feature vectors.
-            target: (B, D) clean image embeddings from the image encoder.
-            mask:   (B,) bool — True ⟹ include this spot.
+            pred: Predicted feature vectors of shape ``(B, D)``.
+            target: Clean image embeddings of shape ``(B, D)`` from the image
+                encoder; detached inside this method.
+            mask: Boolean tensor of shape ``(B,)``; ``True`` = include this spot.
+
         Returns:
-            Scalar cosine-distance loss in [0, 2].
+            Scalar loss in ``[0, 2]``; zero at perfect alignment.
         """
         if not mask.any():
             return pred.sum() * 0.0
         pred_n = F.normalize(pred[mask], dim=-1)
         tgt_n = F.normalize(target[mask].detach(), dim=-1)
-        # 1 − cosine similarity ∈ [0, 2]; 0 when perfect alignment
         return (1.0 - (pred_n * tgt_n).sum(dim=-1)).mean()
 
 
-# ---------------------------------------------------------------------------
-# Combined STORM loss
-# ---------------------------------------------------------------------------
-
 class STORMLoss(nn.Module):
-    """
-    Weighted sum of all STORM training objectives.
+    """Combined STORM training objective.
+
+    Routes each loss component to the appropriate subset of spots based on
+    which modalities are available as inputs:
+
+    - **contrastive**: NT-Xent between image and omics projections, applied
+      only where both modalities are present (needs ≥ 2 such spots).
+    - **omics_recon**: MSE between predicted and actual gene expression, applied
+      to image-only spots (the model must hallucinate omics from image alone).
+    - **omics_recon_reg**: Same prediction on both-present spots as a soft
+      regulariser; weight is typically much smaller than ``w_omics_recon``.
+    - **img_feat_recon**: Cosine distance between predicted and actual image
+      features, applied to omics-only spots.
+
+    Spots where both modalities are dropped contribute no gradient.
 
     Args:
-        w_contrastive:      Weight for NT-Xent loss (both-present spots).
-        w_omics_recon:      Weight for omics reconstruction (image-only spots).
-        w_omics_recon_reg:  Weight for omics reconstruction regulariser (both spots).
-        w_img_feat_recon:   Weight for image-feature reconstruction (omics-only spots).
-        temperature:        Initial contrastive temperature.
+        w_contrastive: Weight for the NT-Xent loss term.
+        w_omics_recon: Weight for the omics reconstruction term.
+        w_omics_recon_reg: Weight for the omics reconstruction regulariser.
+        w_img_feat_recon: Weight for the image feature reconstruction term.
+        temperature: Initial contrastive temperature.
     """
 
     def __init__(
@@ -158,7 +141,6 @@ class STORMLoss(nn.Module):
         self.w_omics_recon = w_omics_recon
         self.w_omics_recon_reg = w_omics_recon_reg
         self.w_img_feat_recon = w_img_feat_recon
-
         self.contrastive = NTXentLoss(temperature)
         self.omics_recon = OmicsReconLoss()
         self.img_feat_recon = ImageFeatReconLoss()
@@ -170,47 +152,36 @@ class STORMLoss(nn.Module):
         drop_image: torch.Tensor,
         drop_omics: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Compute the total STORM loss.
+        """Compute the total STORM loss and its named components.
 
         Args:
-            outputs:    Dict returned by STORMModel.forward().
-            omics_gt:   (B, G) ground-truth gene expression (from the DataLoader,
-                        always available regardless of dropout).
-            drop_image: (B,) bool dropout flags for the image modality.
-            drop_omics: (B,) bool dropout flags for the omics modality.
+            outputs: Output dict from ``STORMModel.forward()``.
+            omics_gt: Ground-truth expression matrix of shape ``(B, G)``.
+                Always available from the DataLoader regardless of dropout.
+            drop_image: Boolean dropout flags of shape ``(B,)`` for images.
+            drop_omics: Boolean dropout flags of shape ``(B,)`` for omics.
 
         Returns:
-            total_loss:  Scalar tensor (with gradient).
-            components:  Dict of named scalar values for logging.
+            A tuple ``(total_loss, components)`` where ``total_loss`` is a
+            differentiable scalar and ``components`` is a dict of named float
+            values suitable for logging.
         """
         has_image = ~drop_image
         has_omics = ~drop_omics
         has_both = has_image & has_omics
-        only_image = has_image & ~has_omics   # omics was dropped → must predict it
-        only_omics = ~has_image & has_omics   # image was dropped → must predict it
-        # has_neither = drop_image & drop_omics → excluded from all losses
+        only_image = has_image & ~has_omics
+        only_omics = ~has_image & has_omics
 
-        device = omics_gt.device
-        total = torch.zeros(1, device=device, requires_grad=False).squeeze()
+        total = torch.zeros(1, device=omics_gt.device).squeeze()
         components: Dict[str, float] = {}
 
-        # ------------------------------------------------------------------
-        # 1. Contrastive loss — spots where both modalities fed as real input
-        # ------------------------------------------------------------------
         if has_both.sum() > 1:
-            loss_c = self.contrastive(
-                outputs["img_proj"][has_both],
-                outputs["omics_proj"][has_both],
-            )
+            loss_c = self.contrastive(outputs["img_proj"][has_both], outputs["omics_proj"][has_both])
             components["contrastive"] = loss_c.item()
             total = total + self.w_contrastive * loss_c
         else:
             components["contrastive"] = 0.0
 
-        # ------------------------------------------------------------------
-        # 2. Omics reconstruction — image-only spots
-        # ------------------------------------------------------------------
         if only_image.any() and self.w_omics_recon > 0:
             loss_or = self.omics_recon(outputs["pred_omics"], omics_gt, only_image)
             components["omics_recon"] = loss_or.item()
@@ -218,25 +189,15 @@ class STORMLoss(nn.Module):
         else:
             components["omics_recon"] = 0.0
 
-        # ------------------------------------------------------------------
-        # 3. Omics reconstruction regulariser — both-present spots
-        # ------------------------------------------------------------------
         if has_both.any() and self.w_omics_recon_reg > 0:
-            loss_or_reg = self.omics_recon(outputs["pred_omics"], omics_gt, has_both)
-            components["omics_recon_reg"] = loss_or_reg.item()
-            total = total + self.w_omics_recon_reg * loss_or_reg
+            loss_reg = self.omics_recon(outputs["pred_omics"], omics_gt, has_both)
+            components["omics_recon_reg"] = loss_reg.item()
+            total = total + self.w_omics_recon_reg * loss_reg
         else:
             components["omics_recon_reg"] = 0.0
 
-        # ------------------------------------------------------------------
-        # 4. Image feature reconstruction — omics-only spots
-        # ------------------------------------------------------------------
         if only_omics.any() and self.w_img_feat_recon > 0:
-            loss_if = self.img_feat_recon(
-                outputs["pred_img_feat"],
-                outputs["img_embed"],  # detached inside the loss
-                only_omics,
-            )
+            loss_if = self.img_feat_recon(outputs["pred_img_feat"], outputs["img_embed"], only_omics)
             components["img_feat_recon"] = loss_if.item()
             total = total + self.w_img_feat_recon * loss_if
         else:
