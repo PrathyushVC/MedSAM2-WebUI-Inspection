@@ -1,0 +1,64 @@
+# STORM base training configuration
+# Override any section in a derived config or via CLI flags.
+
+data:
+  data_path: "data/spatial_dataset.h5"
+  img_size: 224
+  split_ratio: 0.85
+  seed: 42
+  batch_size: 64
+  num_workers: 8
+  gene_filter: null          # null = use all genes; or list of gene indices
+
+model:
+  num_genes: 3000            # must match gene panel size in the dataset
+  embed_dim: 512
+  img_size: 224
+  patch_size: 16
+  img_encoder_depth: 6
+  img_encoder_heads: 8
+  omics_encoder_depth: 4
+  omics_encoder_heads: 8
+  omics_hidden_dim: 1024
+  fusion_depth: 2
+  fusion_heads: 8
+  dropout: 0.1
+  pretrained_image_backbone: null   # e.g. "vit_base_patch16_224" (requires timm)
+  use_gene_tokens: false             # true → per-gene tokens (expensive for large panels)
+
+dropout:
+  # Per-spot probabilities (applied independently each training step)
+  p_drop_image: 0.15        # ~15 % of spots see only their omics
+  p_drop_omics: 0.15        # ~15 % of spots see only their image
+  p_drop_both: 0.05         # ~5 % of spots are fully masked (excluded from loss)
+  # Batch-level (drop an entire modality for the whole batch)
+  p_batch_drop_image: 0.05  # 5 % of steps → image-only batch
+  p_batch_drop_omics: 0.05  # 5 % of steps → omics-only batch
+  seed: null                # null = random each run
+
+loss:
+  w_contrastive: 1.0        # NT-Xent between image and omics projections
+  w_omics_recon: 0.5        # predict omics from image (image-only spots)
+  w_omics_recon_reg: 0.1    # same but applied to both-present spots (regulariser)
+  w_img_feat_recon: 0.5     # predict image features from omics (omics-only spots)
+  temperature: 0.07         # initial contrastive temperature (learnable)
+
+optimizer:
+  lr: 1.0e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  frozen_modules: null       # list of module name prefixes to freeze
+
+training:
+  max_epochs: 200
+  warmup_epochs: 20
+  min_lr_ratio: 0.01         # cosine annealing floor = lr * min_lr_ratio
+  use_amp: true
+  amp_dtype: "bfloat16"      # "bfloat16" or "float16"
+  clip_grad_norm: 1.0
+  save_every: 20             # save a numbered checkpoint every N epochs
+  log_every: 100             # log step metrics every N steps
+  checkpoint_dir: "checkpoints/storm"
+  log_dir: "logs/storm"
+  seed: 42

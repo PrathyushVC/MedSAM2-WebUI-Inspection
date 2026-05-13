@@ -1,0 +1,50 @@
+# Derived config for 10x Visium spatial transcriptomics datasets.
+# Patches are typically 224×224 px; gene panels range from 2000-33000 genes.
+# Tuned for a single A100 80 GB (batch_size=128 with bfloat16 AMP).
+#
+# Inherit from base.yaml — only overrides are listed here.
+
+data:
+  data_path: "data/visium_sample.h5"
+  img_size: 224
+  batch_size: 128
+  num_workers: 8
+  gene_filter: null
+
+model:
+  num_genes: 2000            # after HVG selection
+  embed_dim: 512
+  img_encoder_depth: 8
+  img_encoder_heads: 8
+  omics_encoder_depth: 6
+  omics_encoder_heads: 8
+  omics_hidden_dim: 2048
+  fusion_depth: 3
+  use_gene_tokens: false     # use bulk mode — gene tokens at 2000 genes is fine too
+
+dropout:
+  p_drop_image: 0.20
+  p_drop_omics: 0.20
+  p_drop_both: 0.05
+  p_batch_drop_image: 0.05
+  p_batch_drop_omics: 0.05
+
+loss:
+  w_contrastive: 1.0
+  w_omics_recon: 1.0         # higher weight: gene prediction is a primary objective
+  w_omics_recon_reg: 0.2
+  w_img_feat_recon: 0.5
+  temperature: 0.07
+
+optimizer:
+  lr: 5.0e-5
+  weight_decay: 0.05
+
+training:
+  max_epochs: 300
+  warmup_epochs: 30
+  use_amp: true
+  amp_dtype: "bfloat16"
+  save_every: 50
+  checkpoint_dir: "checkpoints/storm_visium"
+  log_dir: "logs/storm_visium"
